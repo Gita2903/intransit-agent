@@ -13,7 +13,7 @@ load_dotenv()
 
 class InvestigatorEmployee:
     """
-    EMPLOYEE 2: Database Sync, Evidence Cross-Checker & Case Enricher.
+    EMPLOYEE 2: Database Sync, Evidence Cross-Checker, Smart Store/Nota Resolver & Case Enricher.
     Menghubungkan DB Home Lab (kurang_kirim) dengan DB Kantor (v_rekap_selisih_intransit).
     """
 
@@ -56,6 +56,134 @@ class InvestigatorEmployee:
             return ""
         last_num = digits[-1]
         return last_num.zfill(4)[-4:]
+
+    def resolve_store_or_nota(
+        self,
+        kdtk_or_query: str = "",
+        nonota_or_last4: str = "",
+        only_open: bool = True,
+        conn=None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Smart Auto-Lookup: Mencari daftar nota di v_rekap_selisih_intransit
+        hanya dari Kode Toko (misal 'TVKZ'), Nama Toko (misal 'Puri Junction'),
+        atau 4/10 digit nomor nota/SJ (misal '1500' atau '2610171500').
+        Jika belum ada di rekap H-1, otomatis fallback cek ke kurang_kirim_sync!
+        """
+        own_conn = False
+        if conn is None:
+            conn = self.get_office_conn()
+            own_conn = True
+
+        try:
+            with conn.cursor() as cur:
+                where = ["v.kode_fg IS NOT NULL AND TRIM(v.kode_fg) != ''"]
+                params = []
+
+                if only_open:
+                    where.append("COALESCE(act.status, 'Open') = 'Open'")
+
+                q = (kdtk_or_query or "").strip()
+                nota_q = re.sub(r"\D", "", str(nonota_or_last4 or ""))
+
+                if nota_q:
+                    if len(nota_q) >= 8:
+                        where.append("v.nonota = %s")
+                        params.append(nota_q)
+                    else:
+                        where.append("RIGHT(v.nonota, %s) = %s")
+                        params.extend([len(nota_q), nota_q])
+
+                if q:
+                    if len(q) == 4 and re.fullmatch(r"[A-Z0-9]{4}", q.upper()):
+                        where.append("UPPER(v.kdtk) = %s")
+                        params.append(q.upper())
+                    else:
+                        where.append("(UPPER(v.kdtk) = %s OR v.nama_toko LIKE %s)")
+                        params.extend([q.upper(), f"%{q}%"])
+
+                if not params:
+                    return []
+
+                sql = f"""
+                    SELECT
+                        v.tipe,
+                        v.kdcab,
+                        v.kdtk,
+                        v.nama_toko,
+                        v.nonota,
+                        v.tgl_kirim,
+                        DATEDIFF(CURDATE(), v.tgl_kirim) AS aging_days,
+                        SUM(v.qty_selisih) AS total_qty_selisih,
+                        SUM(v.nilai_selisih) AS total_nilai_selisih,
+                        GROUP_CONCAT(DISTINCT v.nama_produk SEPARATOR ', ') AS items_str,
+                        COALESCE(act.tindakan, 'Belum Diproses') AS tindakan,
+                        COALESCE(act.status, 'Open') AS status,
+                        r.leader_recommendation,
+                        r.confidence_score,
+                        r.leader_reasoning
+                    FROM v_rekap_selisih_intransit v
+                    LEFT JOIN rekap_selisih_bk_actions act
+                        ON act.kdtk = v.kdtk AND act.nonota = v.nonota
+                    LEFT JOIN agent_case_reviews r
+                        ON r.kdtk = v.kdtk AND r.nonota = v.nonota
+                    WHERE {' AND '.join(where)}
+                    GROUP BY v.tipe, v.kdcab, v.kdtk, v.nama_toko, v.nonota, v.tgl_kirim,
+                             act.tindakan, act.status, r.leader_recommendation, r.confidence_score, r.leader_reasoning
+                    ORDER BY v.tgl_kirim DESC, v.nonota DESC
+                    LIMIT 10
+                """
+                cur.execute(sql, params)
+                rows = cur.fetchall() or []
+
+                # Jika di rekap H-1 belum ada (misal kasus baru hari ini), cek juga di kurang_kirim_sync!
+                if not rows and (q or nota_q):
+                    kk_where = ["status = 1"]
+                    kk_params = []
+                    if q and len(q) == 4:
+                        kk_where.append("UPPER(kode_toko) = %s")
+                        kk_params.append(q.upper())
+                    if nota_q:
+                        kk_where.append("sj_last4 = %s")
+                        kk_params.append(nota_q[-4:].zfill(4))
+                    if kk_params:
+                        cur.execute(f"""
+                            SELECT kode_toko AS kdtk, tgl_kirim, nomor_surat_jalan, sj_last4, lampiran
+                            FROM kurang_kirim_sync
+                            WHERE {' AND '.join(kk_where)}
+                            ORDER BY tgl_kirim DESC LIMIT 5
+                        """, kk_params)
+                        for kk in cur.fetchall() or []:
+                            tgl_dt = kk["tgl_kirim"]
+                            if hasattr(tgl_dt, "strftime"):
+                                yy_mm_dd = tgl_dt.strftime("%y%m%d")
+                            else:
+                                s_tgl = str(tgl_dt)[:10].replace("-", "")
+                                yy_mm_dd = s_tgl[2:8] if len(s_tgl) == 8 else ""
+                            sj4 = kk.get("sj_last4") or self.extract_clean_sj_last4(kk.get("nomor_surat_jalan"))
+                            inferred_nota = f"{yy_mm_dd}{sj4}" if (yy_mm_dd and sj4) else ""
+                            if inferred_nota:
+                                rows.append({
+                                    "tipe": "Kurang Kirim (Gudang)",
+                                    "kdcab": "-",
+                                    "kdtk": kk["kdtk"],
+                                    "nama_toko": f"Toko {kk['kdtk']}",
+                                    "nonota": inferred_nota,
+                                    "tgl_kirim": str(tgl_dt)[:10],
+                                    "aging_days": 0,
+                                    "total_qty_selisih": 0,
+                                    "total_nilai_selisih": 0.0,
+                                    "items_str": f"Terdaftar di Kurang Kirim (NoSJ: {kk.get('nomor_surat_jalan')})",
+                                    "tindakan": "Belum Diproses",
+                                    "status": "Open",
+                                    "leader_recommendation": "Potong Batch",
+                                    "confidence_score": 95,
+                                    "leader_reasoning": f"Terdaftar di kurang_kirim (lampiran: {kk.get('lampiran')})",
+                                })
+                return rows
+        finally:
+            if own_conn:
+                conn.close()
 
     def sync_kurang_kirim_from_homelab(self, full_sync: bool = False) -> Dict[str, Any]:
         office_conn = self.get_office_conn()
@@ -230,10 +358,8 @@ class InvestigatorEmployee:
                     items_lower = items_str.lower()
                     shelf = exp_map.analyze_case(str(row.get("items_raw") or ""), tgl_str)
                     if exp_map.loaded:
-                        # Berdasarkan mapping umur produk: "pendek" = ada item yang sisa umurnya pas Penjualan Tunai
                         is_short_exp = shelf["penjualan_tunai_all"] or shelf["penjualan_tunai_mixed"]
                     else:
-                        # mapping ga ke-load -> fallback ke tebakan keyword lama
                         is_short_exp = any(kw in items_lower for kw in self.SHORT_EXPIRY_KEYWORDS)
                     is_preorder = any(x.strip().lower().startswith("po ") for x in items_str.split(","))
 
@@ -372,4 +498,10 @@ class InvestigatorEmployee:
               KEY `idx_prec_keyword` (`kata_kunci`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
-        cur.execute("CREATE OR REPLACE VIEW v_rekap_selisih_intransit AS SELECT * FROM rekap_selisih_bk")
+        # Hanya buat view jika belum ada (agar tidak menimpa view produksi di admin_dashboard2)
+        try:
+            cur.execute("SHOW TABLES LIKE 'v_rekap_selisih_intransit'")
+            if not cur.fetchone():
+                cur.execute("CREATE VIEW v_rekap_selisih_intransit AS SELECT * FROM rekap_selisih_bk")
+        except Exception:
+            pass

@@ -174,3 +174,20 @@ Semua panggilan AI lewat `core/llm.py` (endpoint OpenAI-compatible, default `htt
 | Manager | `manager` | `LLM_MODEL_MANAGER` | `manager` |
 
 Saat ini yang benar-benar memanggil AI hanya parser WA PIC (Employee 3, role `worker`, harus support gambar). Keputusan Leader dan briefing Manager masih berbasis aturan/kode. `LLM_MODEL` (tanpa suffix) tetap didukung sebagai fallback semua peran. `LLM_DISABLED=1` mematikan AI.
+
+
+## 💬 Mode Chat Fleksibel & Smart Auto-Lookup DB (Tanpa Format Kaku!)
+
+Mulai versi ini, **Owner (Rendra)** maupun **PIC Cabang/Toko** tidak perlu lagi menghafal format perintah yang kaku atau 10 digit nomor nota (`NONOTA`):
+
+1. **Ketik Kode Toko / Nama Toko Saja (Auto-Cek Intransit & Selisih):**
+   * Cukup kirim chat singkat seperti: `TVKZ` atau `cek toko Puri Junction`
+   * Agent otomatis mengecek tabel `v_rekap_selisih_intransit` (dan fallback ke `kurang_kirim_sync`), lalu membalas daftar `NONOTA`, tanggal kirim, umur kasus (*aging*), item selisih, nilai rupiah, serta rekomendasi Leader.
+2. **Minta PDF Surat Jalan (SJ) Hanya dengan Kode Toko / 4 Digit Akhir SJ:**
+   * Contoh chat bebas: `minta sj toko TASC dong`, `tolong pdf sj TVKZ`, atau `sj 1196 toko TC08`
+   * Agent otomatis mencari `NONOTA` 10 digit yang terkait di database, mengunduh PDF Surat Jalan dari IIAWeb, dan langsung mengirimkannya ke WhatsApp pengirim!
+3. **Laporan Klaim PIC Tanpa Nomor Nota (Auto-Enrich DB):**
+   * Saat PIC melapor kendala tanpa menyebut nomor nota (misal: *"Pak toko T4BU barang sambal tidak datang ya"*), Agent otomatis mencari `NONOTA` dan `tgl_kirim` aktif milik toko `T4BU` di database dan langsung menautkannya ke `agent_waiting_list`.
+4. **Eksekusi Tindakan dengan Bahasa Santai (Khusus Owner):**
+   * Anda bisa langsung membalas santai: `eh yang toko TASC potong batch aja bro` atau `TVKZ 1500 sj ulang` (atau `SET TVKZ SJ Ulang` tanpa menulis nomor nota).
+   * Jika toko hanya punya 1 nota `Open`, Agent langsung mengeksekusinya ke database. Jika ada lebih dari 1 nota `Open`, Agent akan menampilkan daftarnya dan menanyakan nota mana yang ingin dieksekusi.

@@ -5,7 +5,7 @@ import json
 import argparse
 import threading
 from datetime import date, datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -59,12 +59,42 @@ def _run_blast_in_background(owner_jid: str):
 _KDTK_STOPWORDS = {
     "TOKO", "TAPI", "TADI", "TAHU", "TUNAI", "OKEE", "OKAY", "FOTO", "RETUR", "ROTI",
     "DARI", "KODE", "NAMA", "ASAL", "TUJU", "ITEM", "SAMA", "BEDA", "KARE", "SUSA",
+    "MINTA", "KIRIM", "TOLONG", "NOTA", "SURAT", "JALAN", "CEK", "LIHAT", "INFO", "PAGI",
+    "SIANG", "SORE", "MALAM", "BISA", "BARU", "LAMA", "BUAT", "UDAH", "SUDAH", "BELUM",
+    "YANG", "KALO", "KALAU", "ATAU", "SAYA", "KAMI", "KITA", "PAK", "MAS", "BRO", "BOS",
 }
+
+_ID_STOPWORDS = {
+    "karena", "karna", "sebab", "kondisi", "info", "infonya", "ada", "adalah", "yaitu",
+    "untuk", "buat", "yang", "di", "ke", "dari", "pada", "dalam", "ini", "itu", "tersebut",
+    "sudah", "udah", "belum", "masih", "sedang", "lagi", "akan", "bisa", "tidak", "ga", "gak",
+    "enggak", "tolong", "mohon", "minta", "pak", "bu", "mas", "bro", "bos", "ya", "yaa", "dong",
+}
+
+
+def _extract_smart_keyword(alasan: str) -> str:
+    """
+    Ekstrak kata kunci preseden yang bersih:
+      - Jika ada delimiter '|', ambil bagian sebelum '|' sebagai kata kunci eksplisit,
+        contoh: 'toko renovasi | Karena toko sedang tutup renovasi 3 hari' -> 'toko renovasi'.
+      - Jika tanpa '|', buang kata sambung/stopwords umum di awal kalimat lalu ambil 3 kata inti,
+        contoh: 'Karena toko sedang tutup renovasi 3 hari' -> 'toko tutup renovasi'.
+    """
+    raw = (alasan or "").strip()
+    if "|" in raw:
+        kw_part, _ = raw.split("|", 1)
+        if kw_part.strip():
+            return kw_part.strip().lower()[:100]
+
+    tokens = re.findall(r"[a-zA-Z0-9]+", raw.lower())
+    meaningful = [t for t in tokens if t not in _ID_STOPWORDS]
+    chosen = meaningful[:3] if meaningful else tokens[:3]
+    return " ".join(chosen).strip()[:100]
 
 
 def _find_kdtk(caption_text: str):
     """Cari kode toko 4 karakter. Prioritas pola 'KODE [TOKO] : XXXX', lalu 'TOKO XXXX', lalu token toko T/F/O/R."""
-    up = caption_text.upper()
+    up = (caption_text or "").upper()
     for m in re.finditer(r"\bKODE(?:\s+TOKO)?\s*[:=]\s*([A-Z0-9]{4})\b", up):
         if m.group(1) not in _KDTK_STOPWORDS:
             return m
@@ -77,15 +107,117 @@ def _find_kdtk(caption_text: str):
     return None
 
 
+def _extract_store_name_query(text: str) -> str:
+    """Jika user menyebut 'toko Puri Junction' atau 'cek manggarai' tanpa kode 4 huruf, ambil nama tokonya."""
+    m = re.search(r"\btoko\s+([a-zA-Z0-9 ]{4,30})", text, re.IGNORECASE)
+    if m:
+        candidate = m.group(1).strip()
+        # Buang kata komando di ujung
+        candidate = re.sub(r"\b(dong|ya|pak|bro|bos|minta|sj|pdf|surat jalan|intransit|selisih|potong batch|sj ulang|beban karyawan|penjualan tunai).*$", "", candidate, flags=re.IGNORECASE).strip()
+        if len(candidate) >= 4 and candidate.upper() not in _KDTK_STOPWORDS:
+            return candidate
+    return ""
+
+
+def format_store_lookup_reply(query_label: str, rows: List[Dict[str, Any]], is_owner: bool = False) -> str:
+    """Format balasan saat orang kirim kode toko / cek status toko di DB."""
+    if not rows:
+        return (
+            f"🔍 *Cek Data Toko `{query_label}`:*\n"
+            f"Saat ini tidak ditemukan nota *Intransit / Selisih BK* yang masih berstatus *Open* di database untuk `{query_label}`."
+        )
+
+    first = rows[0]
+    header = f"🏪 *DATA AKTIF TOKO {first['kdtk']} ({first.get('nama_toko') or '-'})*"
+    if len( {r['kdtk'] for r in rows} ) > 1:
+        header = f"🔍 *HASIL PENCARIAN `{query_label}` ({len(rows)} Nota Aktif)*"
+
+    lines = [header, f"📍 Cabang: *{first.get('kdcab') or '-'}* | Total: *{len(rows)} Nota Open*", ""]
+    for i, r in enumerate(rows, 1):
+        rec_str = f" | 🤖 Saran: `{r['leader_recommendation']}`" if (is_owner and r.get("leader_recommendation")) else ""
+        lines.append(
+            f"{i}. Nota: *`{r['nonota']}`* ({r['tgl_kirim']} • {r.get('aging_days', 0)} hr)\n"
+            f"   📌 Status: *{r['tipe']}* | Nilai: *Rp {float(r.get('total_nilai_selisih') or 0):,.0f}* | Tindakan: `{r.get('tindakan') or 'Belum Diproses'}`{rec_str}\n"
+            f"   📦 Item: _{(r.get('items_str') or '-')[:120]}_"
+        )
+
+    lines.append("")
+    if is_owner:
+        lines.append("💡 *Tips:* Balas santai aja, misal: `minta sj " + first['kdtk'] + "` atau `" + first['kdtk'] + " potong batch`")
+    else:
+        lines.append("💡 _Butuh PDF Surat Jalan? Cukup balas: `minta sj " + first['kdtk'] + "` atau langsung infokan kendalanya di sini._")
+    return "\n".join(lines)
+
+
+def _handle_sj_request(text: str, target: str, conn=None) -> str:
+    """
+    Smart SJ Downloader & Sender:
+    Bisa dipicu dengan cara santai:
+      1. Sebut 10 digit nota: 'minta sj 2610171500'
+      2. Sebut kode toko saja tanpa hafal nomor nota: 'minta sj TVKZ dong' -> auto-lookup DB!
+      3. Sebut kode toko + 4 digit akhir SJ: 'sj 1500 toko TVKZ' -> auto-lookup DB!
+      4. Sebut nama toko: 'minta pdf surat jalan toko puri junction' -> auto-lookup DB!
+    """
+    cmd = text.strip().upper()
+    if cmd.startswith(("SET ", "PRESEDEN ", "REG PIC")):
+        return ""
+
+    wants_sj = bool(re.search(r"\b(SJ|PDF|SURAT\s+JALAN)\b", cmd)) and not bool(re.search(r"\bSJ\s+ULANG\b", cmd))
+    if not wants_sj:
+        return ""
+
+    # 1. Cek apakah ada 10 digit nonota langsung di teks
+    notas_10 = list(dict.fromkeys(re.findall(r"\b(2[56]\d{8})\b", cmd)))
+
+    # 2. Kalau tidak ada 10 digit, auto-lookup ke database dari Kode Toko / Nama Toko / 4 digit akhir SJ!
+    resolved_rows = []
+    if not notas_10:
+        kdtk_m = _find_kdtk(text)
+        kdtk_or_name = kdtk_m.group(1) if kdtk_m else _extract_store_name_query(text)
+        last4_candidates = [d for d in re.findall(r"\b(\d{4})\b", cmd) if d not in {"2025", "2026"}]
+        last4 = last4_candidates[0] if last4_candidates else ""
+
+        if kdtk_or_name or last4:
+            resolved_rows = manager.emp_investigator.resolve_store_or_nota(
+                kdtk_or_query=kdtk_or_name,
+                nonota_or_last4=last4,
+                only_open=False,
+                conn=conn,
+            )
+            notas_10 = list(dict.fromkeys(r["nonota"] for r in resolved_rows if r.get("nonota")))
+
+    if not notas_10:
+        return (
+            "⚠️ Gue udah cek database tapi belum nemu nomor nota yang cocok buat diambil PDF Surat Jalannya.\n"
+            "Coba sebutin *Kode Toko* (contoh: `minta sj TVKZ`) atau *Nomor Nota*-nya ya!"
+        )
+
+    out = []
+    if resolved_rows:
+        toko_info = f"{resolved_rows[0]['kdtk']} ({resolved_rows[0].get('nama_toko') or '-'})"
+        out.append(f"🔍 Auto-lookup DB untuk *{toko_info}* → ditemukan *{len(notas_10[:5])} nota*:")
+
+    for nota in notas_10[:5]:
+        try:
+            pdf = manager.emp_pipeline.download_sj_pdf_by_nota(nota)
+        except Exception as e:
+            out.append(f"❌ `{nota}` gagal diambil dari IIA: {str(e)[:120]}")
+            continue
+        res = manager.emp_comm.send_whatsapp_document(target, pdf["file_path"], f"Surat Jalan {nota}")
+        out.append(f"❌ `{nota}` gagal dikirim: {str(res['error'])[:120]}" if "error" in res else f"✅ PDF SJ `{nota}` terkirim")
+    return "\n".join(out)
+
+
 def parse_pic_whatsapp_with_llm(sender_name: str, caption_text: str, image_base64: Optional[str] = None) -> Dict[str, Any]:
     kdtk_match = _find_kdtk(caption_text)
-    nota_match = re.search(r"\b(26\d{8})\b", caption_text)
+    nota_match = re.search(r"\b(2[56]\d{8})\b", caption_text)
+    last4_match = re.search(r"\b(?:sj|nota|npb)\s*[:#-]?\s*(\d{4})\b", caption_text, re.IGNORECASE)
 
-    if not llm_enabled():  # LLM_DISABLED=1 -> parser regex sederhana
+    if not llm_enabled():
         return {
-            "is_claim_report": bool(kdtk_match or nota_match or "intransit" in caption_text.lower() or "selisih" in caption_text.lower()),
+            "is_claim_report": bool(kdtk_match or nota_match or "intransit" in caption_text.lower() or "selisih" in caption_text.lower() or "kurang" in caption_text.lower() or "tidak datang" in caption_text.lower()),
             "kdtk": kdtk_match.group(1) if kdtk_match else "UNKNOWN",
-            "nonota": nota_match.group(1) if nota_match else "",
+            "nonota": nota_match.group(1) if nota_match else (last4_match.group(1) if last4_match else ""),
             "tgl_kirim": date.today().strftime("%Y-%m-%d"),
             "item_dilaporkan": "Lihat lampiran/teks",
             "klaim_pic": caption_text,
@@ -99,23 +231,28 @@ def parse_pic_whatsapp_with_llm(sender_name: str, caption_text: str, image_base6
     Tugasmu: Analisis teks dan gambar terlampir (bisa berupa foto layar komputer Daftar NPB/BPB toko atau kertas Surat Jalan).
     Balas HANYA dengan JSON murni (tanpa penjelasan, tanpa markdown) dengan key berikut:
     - "is_claim_report": boolean (true jika ini laporan barang kurang datang / minta hilangkan intransit / selisih / PLU mati / salah toko / relokasi)
-    - "kdtk": string (4 karakter kode toko, contoh: "TVKZ")
-    - "nonota": string (10 digit nomor nota / NO NPB yang di-highlight di layar monitor, contoh: "2610171500", atau kosongkan jika tidak terlihat)
+    - "kdtk": string (4 karakter kode toko, contoh: "TVKZ", atau kosongkan jika hanya ada nama toko)
+    - "nama_toko_disebut": string (nama toko jika disebut di teks/gambar, contoh: "Puri Junction")
+    - "nonota": string (10 digit nomor nota / NO NPB yang terlihat di layar monitor/teks, atau 4 digit terakhirnya jika hanya 4 digit, atau kosongkan)
     - "tgl_kirim": string (format YYYY-MM-DD dari TGL NPB atau tanggal hari ini {date.today().strftime('%Y-%m-%d')})
     - "item_dilaporkan": string (nama produk/PLU yang bermasalah/diedit 0, contoh: "Y/M DIMSUM AYAM (PLU: 20110796)")
     - "klaim_pic": string (ringkasan klaim toko/PIC, misal: "Barang tidak datang, diedit 0 di BPB, minta hilangkan intransit")
     """
 
     try:
-        result = ask_json(prompt, image_base64, role="worker")  # Employee 3 (WA parser) = model worker
+        result = ask_json(prompt, image_base64, role="worker")
         if result.pop("_image_ignored", False):
             result["klaim_pic"] = f"{result.get('klaim_pic', '')} [foto tidak terbaca model, hanya teks]".strip()
+        if (not result.get("kdtk") or result.get("kdtk") == "UNKNOWN") and kdtk_match:
+            result["kdtk"] = kdtk_match.group(1)
+        if not result.get("nonota") and nota_match:
+            result["nonota"] = nota_match.group(1)
         return result
     except Exception as e:
         return {
             "is_claim_report": True,
             "kdtk": kdtk_match.group(1) if kdtk_match else "UNKNOWN",
-            "nonota": nota_match.group(1) if nota_match else "",
+            "nonota": nota_match.group(1) if nota_match else (last4_match.group(1) if last4_match else ""),
             "tgl_kirim": date.today().strftime("%Y-%m-%d"),
             "item_dilaporkan": f"Fallback Parser ({e})",
             "klaim_pic": caption_text,
@@ -142,21 +279,66 @@ def _parse_tindakan_and_rest(raw: str) -> Tuple[Optional[str], str]:
     return None, raw_s
 
 
-def _handle_sj_request(cmd: str, target: str) -> str:
-    """Kalau pesan (uppercase) minta SJ/PDF + nomor nota 10 digit: kirim PDF-nya ke target. Return laporan, atau "" kalau bukan permintaan SJ."""
-    notas = list(dict.fromkeys(re.findall(r"\b\d{10}\b", cmd)))
-    if not notas or not re.search(r"\b(SJ|PDF|SURAT JALAN)\b", cmd) or cmd.startswith(("SET ", "PRESEDEN ")):
-        return ""
-    out = []
-    for nota in notas[:10]:  # shortcut: max 10 per pesan, naikkan kalau perlu
-        try:
-            pdf = manager.emp_pipeline.download_sj_pdf_by_nota(nota)
-        except Exception as e:
-            out.append(f"❌ `{nota}` gagal diambil: {str(e)[:120]}")
-            continue
-        res = manager.emp_comm.send_whatsapp_document(target, pdf["file_path"], f"Surat Jalan {nota}")
-        out.append(f"❌ `{nota}` gagal dikirim: {str(res['error'])[:120]}" if "error" in res else f"✅ `{nota}` terkirim")
-    return "\n".join(out)
+def _detect_natural_tindakan(text: str) -> Optional[str]:
+    """Deteksi tindakan dari kalimat santai (misal 'tvkz potong batch aja bro')."""
+    up = text.upper()
+    if "POTONG BATCH" in up or re.search(r"\bPB\b", up):
+        return "Potong Batch"
+    if "SJ ULANG" in up or "BUATKAN SJ" in up or "NOTA ULANG" in up:
+        return "SJ Ulang"
+    if "BEBAN KARYAWAN" in up or "BEBAN DRIVER" in up or "BEBAN PICKING" in up:
+        return "Beban Karyawan"
+    if "PENJUALAN TUNAI" in up or "JUAL TUNAI" in up:
+        return "Penjualan Tunai"
+    return None
+
+
+def _execute_single_set_action(conn, kdtk: str, nonota: str, tindakan: str) -> str:
+    """Helper untuk mengeksekusi tindakan + mencatat override jika berbeda dari saran Leader."""
+    kdtk = kdtk.upper().strip()
+    nonota = nonota.strip()
+    prev_rec = None
+    is_override = False
+
+    with conn.cursor() as cur:
+        manager.emp_investigator._ensure_agent_tables(cur)
+        cur.execute("""
+            SELECT leader_recommendation, confidence_score, leader_reasoning
+            FROM agent_case_reviews
+            WHERE kdtk = %s AND nonota = %s
+        """, [kdtk, nonota])
+        prev = cur.fetchone()
+
+        if prev:
+            prev_rec = prev["leader_recommendation"]
+            if prev_rec != tindakan:
+                is_override = True
+                cur.execute("""
+                    INSERT INTO agent_overrides
+                        (kdtk, nonota, leader_recommendation, confidence_score, leader_reasoning, rendra_decision, override_source)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'WA_SET')
+                """, [kdtk, nonota, prev_rec, prev["confidence_score"] or 0, prev["leader_reasoning"] or "", tindakan])
+
+        cur.execute("""
+            UPDATE agent_case_reviews
+            SET manager_decision = 'APPROVED_BY_RENDRA'
+            WHERE kdtk = %s AND nonota = %s
+        """, [kdtk, nonota])
+        conn.commit()
+
+    manager.leader.execute_approved_actions_to_db([{
+        "kdtk": kdtk,
+        "nonota": nonota,
+        "tindakan": tindakan,
+        "leader_reasoning": f"Approved manual via WA oleh Rendra ({datetime.now().strftime('%d/%m %H:%M')})"
+    }], conn)
+
+    if is_override:
+        return (
+            f"✅ Mantap Bos! Nota `{nonota}` (Toko *{kdtk}*) di-set ke *`{tindakan}`*.\n"
+            f"📝 Catatan: Override dari saran Leader (`{prev_rec}`) telah dicatat untuk evaluasi mingguan."
+        )
+    return f"✅ Mantap Bos! Nota `{nonota}` (Toko *{kdtk}*) berhasil di-set ke *`{tindakan}`* (Status: `Open`)."
 
 
 def _is_registered_pic(conn, sender_digits: str) -> bool:
@@ -170,6 +352,7 @@ def handle_owner_command(text: str, owner_jid: str = "") -> str:
     conn = manager.emp_investigator.get_office_conn()
 
     try:
+        # ── 1. KOMANDO EKSPLISIT CEPAT ───────────────────────────────────────
         if cmd == "BLAST PIC":
             return manager.emp_comm.build_blast_preview(conn)
 
@@ -182,7 +365,8 @@ def handle_owner_command(text: str, owner_jid: str = "") -> str:
         if cmd == "LIST PIC":
             return manager.emp_comm.list_pic_contacts(conn)
 
-        sj_reply = _handle_sj_request(cmd, owner_jid or manager.emp_comm.owner_wa)
+        # Cek permintaan PDF SJ (baik pakai 10 digit nota, kode toko saja, atau 4 digit akhir)
+        sj_reply = _handle_sj_request(text, owner_jid or manager.emp_comm.owner_wa, conn=conn)
         if sj_reply:
             return sj_reply
 
@@ -194,7 +378,7 @@ def handle_owner_command(text: str, owner_jid: str = "") -> str:
             nama = parts[4] if len(parts) > 4 else ""
             return manager.emp_comm.register_pic_contact(conn, kdcab, target, nama)
 
-        if cmd == "ACC PB":
+        if cmd in ("ACC PB", "GAS PB", "APPROVE PB"):
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT kdtk, nonota, leader_recommendation, leader_reasoning
@@ -221,7 +405,7 @@ def handle_owner_command(text: str, owner_jid: str = "") -> str:
                     f"*`Potong Batch`* dengan status *`Open`* di tabel `rekap_selisih_bk_actions`."
                 )
 
-        if cmd == "CEK REVIEW":
+        if cmd in ("CEK REVIEW", "REVIEW", "LIST REVIEW"):
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT kdcab, kdtk, nonota, nilai_selisih, leader_recommendation, leader_reasoning
@@ -243,67 +427,44 @@ def handle_owner_command(text: str, owner_jid: str = "") -> str:
                         f"   👉 *Saran Leader:* `{r['leader_recommendation']}`\n"
                         f"   📝 *Alasan:* {r['leader_reasoning']}\n"
                     )
-                lines.append("💡 Ketik: `SET <KDTK> <NONOTA> <Potong Batch|SJ Ulang|Beban Karyawan|Penjualan Tunai>` untuk eksekusi.")
+                lines.append("💡 Balas santai aja, misal: `<KDTK> potong batch` atau `SET <KDTK> <NONOTA> <Tindakan>`")
                 return "\n".join(lines)
 
         if cmd.startswith("SET "):
             parts = text.strip().split(maxsplit=3)
-            if len(parts) < 4:
-                return "⚠️ Format salah Bos. Gunakan: `SET <KDTK> <NONOTA> <Tindakan>`\nContoh: `SET TVKZ 2610171500 SJ Ulang`"
+            if len(parts) < 3:
+                return "⚠️ Gunakan: `SET <KDTK> [NONOTA] <Tindakan>`\nContoh: `SET TVKZ 2610171500 SJ Ulang` atau `SET TVKZ SJ Ulang`"
 
-            _, kdtk, nonota, sisa = parts
+            # Support baik `SET TVKZ 2610171500 SJ Ulang` maupun `SET TVKZ SJ Ulang` (tanpa nonota!)
+            kdtk = parts[1].upper()
+            if len(parts) == 4 and re.fullmatch(r"\d{4,12}", parts[2]):
+                nonota_arg = parts[2]
+                sisa = parts[3]
+            else:
+                nonota_arg = ""
+                sisa = " ".join(parts[2:])
+
             tindakan, _ = _parse_tindakan_and_rest(sisa)
             if not tindakan:
                 return f"❌ Tindakan `{sisa}` ga valid. Pilih: Potong Batch, SJ Ulang, Beban Karyawan, atau Penjualan Tunai."
 
-            prev_rec = None
-            is_override = False
-            with conn.cursor() as cur:
-                manager.emp_investigator._ensure_agent_tables(cur)
-                cur.execute("""
-                    SELECT leader_recommendation, confidence_score, leader_reasoning
-                    FROM agent_case_reviews
-                    WHERE kdtk = %s AND nonota = %s
-                """, [kdtk.upper(), nonota])
-                prev = cur.fetchone()
+            if not nonota_arg or len(nonota_arg) < 8:
+                matched = manager.emp_investigator.resolve_store_or_nota(kdtk_or_query=kdtk, nonota_or_last4=nonota_arg, only_open=True, conn=conn)
+                if not matched:
+                    return f"⚠️ Gue cek di DB ga ada nota Open untuk toko *{kdtk}* {('dengan buntut ' + nonota_arg) if nonota_arg else ''}."
+                if len(matched) > 1 and not nonota_arg:
+                    nota_list = ", ".join(f"`{m['nonota']}` ({m['tgl_kirim']})" for m in matched[:5])
+                    return f"🧐 Bos, toko *{kdtk}* punya *{len(matched)} nota Open*: {nota_list}.\nSebutin 4 digit buntut notanya ya, misal: `{kdtk} {matched[0]['nonota'][-4:]} {tindakan}`"
+                nonota_arg = matched[0]["nonota"]
 
-                if prev:
-                    prev_rec = prev["leader_recommendation"]
-                    if prev_rec != tindakan:
-                        is_override = True
-                        cur.execute("""
-                            INSERT INTO agent_overrides
-                                (kdtk, nonota, leader_recommendation, confidence_score, leader_reasoning, rendra_decision, override_source)
-                            VALUES (%s, %s, %s, %s, %s, %s, 'WA_SET')
-                        """, [kdtk.upper(), nonota, prev_rec, prev["confidence_score"] or 0, prev["leader_reasoning"] or "", tindakan])
-
-                cur.execute("""
-                    UPDATE agent_case_reviews
-                    SET manager_decision = 'APPROVED_BY_RENDRA'
-                    WHERE kdtk = %s AND nonota = %s
-                """, [kdtk.upper(), nonota])
-                conn.commit()
-
-            manager.leader.execute_approved_actions_to_db([{
-                "kdtk": kdtk.upper(),
-                "nonota": nonota,
-                "tindakan": tindakan,
-                "leader_reasoning": f"Approved manual via WA oleh Rendra ({datetime.now().strftime('%d/%m %H:%M')})"
-            }], conn)
-
-            if is_override:
-                return (
-                    f"✅ Mantap Bos! Nota `{nonota}` (Toko *{kdtk.upper()}*) di-set ke *`{tindakan}`*.\n"
-                    f"📝 Catatan: Override dari saran Leader (`{prev_rec}`) telah dicatat untuk evaluasi mingguan."
-                )
-            return f"✅ Mantap Bos! Nota `{nonota}` (Toko *{kdtk.upper()}*) berhasil di-set ke *`{tindakan}`* (Status: `Open`)."
+            return _execute_single_set_action(conn, kdtk, nonota_arg, tindakan)
 
         if cmd.startswith("PRESEDEN "):
             parts = text.strip().split(maxsplit=3)
             if len(parts) < 4:
                 return (
-                    "⚠️ Format: `PRESEDEN <KDTK> <NONOTA> <Tindakan> <Kata Kunci / Alasan>`\n"
-                    "Contoh: `PRESEDEN TVKZ 2610171500 SJ Ulang Toko tutup renovasi 3 hari`"
+                    "⚠️ Format: `PRESEDEN <KDTK> <NONOTA> <Tindakan> <Kata Kunci | Alasan>`\n"
+                    "Contoh: `PRESEDEN TVKZ 2610171500 SJ Ulang toko renovasi | Toko tutup renovasi 3 hari`"
                 )
 
             _, kdtk, nonota, sisa = parts
@@ -315,8 +476,14 @@ def handle_owner_command(text: str, owner_jid: str = "") -> str:
                     "Contoh: `PRESEDEN TVKZ 2610171500 SJ Ulang Toko tutup renovasi 3 hari`"
                 )
 
-            kw = alasan.split()[0:3]
-            kw_clean = " ".join(kw).lower().strip()
+            # Jika nonota yang diketik hanya 4 digit, auto-resolve ke 10 digit dari DB
+            if len(re.sub(r"\D", "", nonota)) < 8:
+                matched = manager.emp_investigator.resolve_store_or_nota(kdtk_or_query=kdtk, nonota_or_last4=nonota, only_open=False, conn=conn)
+                if matched:
+                    nonota = matched[0]["nonota"]
+
+            kw_clean = _extract_smart_keyword(alasan)
+            alasan_clean = alasan.split("|", 1)[-1].strip() if "|" in alasan else alasan.strip()
 
             with conn.cursor() as cur:
                 manager.emp_investigator._ensure_agent_tables(cur)
@@ -339,7 +506,7 @@ def handle_owner_command(text: str, owner_jid: str = "") -> str:
                     INSERT INTO agent_precedents
                         (kata_kunci, kategori, tindakan, alasan, contoh_kasus, created_by)
                     VALUES (%s, 'kasus_khusus', %s, %s, %s, 'Rendra')
-                """, [kw_clean, tindakan, alasan, f"{kdtk.upper()} / {nonota}"])
+                """, [kw_clean, tindakan, alasan_clean, f"{kdtk.upper()} / {nonota}"])
                 prec_id = cur.lastrowid
 
                 cur.execute("""
@@ -353,7 +520,7 @@ def handle_owner_command(text: str, owner_jid: str = "") -> str:
                 "kdtk": kdtk.upper(),
                 "nonota": nonota,
                 "tindakan": tindakan,
-                "leader_reasoning": f"Preseden #{prec_id} via WA Rendra: {alasan}"[:250]
+                "leader_reasoning": f"Preseden #{prec_id} via WA Rendra: {alasan_clean}"[:250]
             }], conn)
 
             return (
@@ -361,7 +528,7 @@ def handle_owner_command(text: str, owner_jid: str = "") -> str:
                 f"• Kasus: Toko *{kdtk.upper()}* (Nota `{nonota}`)\n"
                 f"• Tindakan: *`{tindakan}`* (Status: `Open`)\n"
                 f"• Kata Kunci Rujukan: *'{kw_clean}'*\n"
-                f"• Alasan: _{alasan}_\n"
+                f"• Alasan: _{alasan_clean}_\n"
                 f"📌 Lain kali klaim serupa muncul, Leader akan merekomendasikan `{tindakan}` sesuai preseden ini."
             )
 
@@ -389,20 +556,52 @@ def handle_owner_command(text: str, owner_jid: str = "") -> str:
                 days = max(1, min(90, int(sub_parts[1])))
             return manager.build_weekly_evaluation(conn, days=days)
 
+        # ── 2. CONVERSATIONAL & NATURAL LANGUAGE MODE (TANPA FORMAT KAKU!) ──
+        kdtk_m = _find_kdtk(text)
+        kdtk_code = kdtk_m.group(1) if kdtk_m else ""
+        store_name_q = "" if kdtk_code else _extract_store_name_query(text)
+        nota_10_m = re.search(r"\b(2[56]\d{8})\b", cmd)
+        last4_m = re.search(r"\b(\d{4})\b", cmd) if not nota_10_m else None
+        nota_hint = nota_10_m.group(1) if nota_10_m else (last4_m.group(1) if (last4_m and last4_m.group(1) not in {"2025", "2026"}) else "")
+        natural_action = _detect_natural_tindakan(text)
+
+        # 2A. Kalau Bos Rendra nyebut Toko/Nota + Tindakan secara santai (misal: "tvkz potong batch aja" atau "nota 1500 tvkz set sj ulang")
+        if natural_action and (kdtk_code or store_name_q or nota_hint):
+            matched = manager.emp_investigator.resolve_store_or_nota(
+                kdtk_or_query=kdtk_code or store_name_q,
+                nonota_or_last4=nota_hint,
+                only_open=True,
+                conn=conn,
+            )
+            if not matched:
+                return f"⚠️ Gue udah cari di DB untuk `{kdtk_code or store_name_q or nota_hint}`, tapi ga ada nota Open yang cocok buat di-set ke *{natural_action}*."
+            if len(matched) > 1 and not nota_10_m:
+                nota_list = "\n".join(f"• `{m['nonota']}` (Tgl {m['tgl_kirim']} • Rp {float(m.get('total_nilai_selisih') or 0):,.0f})" for m in matched[:5])
+                return (
+                    f"🧐 Bos, untuk toko *{matched[0]['kdtk']}* ada *{len(matched)} nota Open* di DB:\n{nota_list}\n\n"
+                    f"Mau yang mana yang di-set ke *{natural_action}*? Balas aja: `{matched[0]['kdtk']} {matched[0]['nonota'][-4:]} {natural_action}`"
+                )
+            target_row = matched[0]
+            return _execute_single_set_action(conn, target_row["kdtk"], target_row["nonota"], natural_action)
+
+        # 2B. Kalau Bos Rendra cuma ngetik kode toko ("TVKZ"), nama toko ("cek toko puri junction"), atau nomor nota ("2610171500")
+        if kdtk_code or store_name_q or nota_hint:
+            matched = manager.emp_investigator.resolve_store_or_nota(
+                kdtk_or_query=kdtk_code or store_name_q,
+                nonota_or_last4=nota_hint,
+                only_open=True,
+                conn=conn,
+            )
+            return format_store_lookup_reply(kdtk_code or store_name_q or nota_hint, matched, is_owner=True)
+
         return (
-            "🤖 *Menu Komando Manager Agent:*\n"
-            "• `RUN MORNING` — Jalankan sync & audit sekarang\n"
-            "• `ACC PB` — Eksekusi semua nota valid Potong Batch\n"
-            "• `CEK REVIEW` — Lihat nota yang butuh keputusan manual\n"
-            "• `SET <KDTK> <NONOTA> <Tindakan>` — Set tindakan manual\n"
-            "• `PRESEDEN <KDTK> <NONOTA> <Tindakan> <Alasan>` — Set & simpan preseden kasus baru\n"
-            "• `LIST PRESEDEN` — Lihat daftar preseden kasus khusus\n"
-            "• `EVALUASI [HARI]` — Laporan evaluasi mingguan & override rate\n"
-            "• `BLAST PIC` — Preview tagihan ke PIC Cabang (belum kirim)\n"
-            "• `BLAST PIC KONFIRM` — Kirim tagihan beneran\n"
-            "• `REG PIC <KDCAB> <NOMOR/JID> <NAMA>` — Daftarin kontak PIC\n"
-            "• `LIST PIC` — Lihat kontak PIC terdaftar\n"
-            "• `SJ <NONOTA>` — Kirim PDF Surat Jalan ke WA lo"
+            "🤖 *Asisten Operasional Rendra Siap!*\n"
+            "Lo bisa langsung chat santai (ga perlu format kaku), contoh:\n"
+            "• Ketik kode toko aja: `TVKZ` → auto-cek semua nota intransit/selisih di DB\n"
+            "• Minta PDF SJ pakai kode toko: `minta sj TVKZ` → auto-cari nonota & kirim PDF\n"
+            "• Eksekusi langsung: `TVKZ potong batch` atau `TVKZ 1500 sj ulang`\n\n"
+            "📌 *Shortcut Komando Cepat:*\n"
+            "• `ACC PB` | `CEK REVIEW` | `BLAST PIC` | `EVALUASI` | `RUN MORNING`"
         )
     finally:
         conn.close()
@@ -467,6 +666,8 @@ def whatsapp_webhook():
 
     is_owner = bool(owner_digits and (owner_digits == sender_digits or owner_digits in sender_digits))
     print(f"[WA] from={remote_jid} owner={is_owner} text={text_msg[:60]!r}")
+
+    # ── KASUS A: PESAN DARI OWNER (BOS RENDRA) ───────────────────────────────
     if is_owner:
         if text_msg.strip().upper() == "RUN MORNING":
             res = manager.run_morning_workflow(auto_execute_high_confidence=False)
@@ -476,30 +677,75 @@ def whatsapp_webhook():
         manager.emp_comm.send_whatsapp_text(remote_jid, reply)
         return jsonify({"status": "owner_command_executed"})
 
-    if sender_digits and text_msg:
-        conn = manager.emp_investigator.get_office_conn()
-        try:
-            known_pic = _is_registered_pic(conn, sender_digits)
-        finally:
-            conn.close()
-        if known_pic:
-            sj_reply = _handle_sj_request(text_msg.strip().upper(), remote_jid)
-            if sj_reply:
-                manager.emp_comm.send_whatsapp_text(remote_jid, sj_reply)
-                return jsonify({"status": "sj_sent_to_pic"})
-
-    extracted = parse_pic_whatsapp_with_llm(push_name, text_msg, image_b64)
-    if not extracted.get("is_claim_report"):
-        return jsonify({"status": "not_a_claim_report"}), 200
-
+    # ── KASUS B: PESAN DARI PIC CABANG / TOKO (FLEKSIBEL & AUTO-LOOKUP DB) ───
     conn = manager.emp_investigator.get_office_conn()
     try:
+        known_pic = _is_registered_pic(conn, sender_digits) if sender_digits else False
+
+        # B1. Jika PIC minta PDF Surat Jalan (bisa cuma sebut kode toko: 'minta sj TVKZ' atau nomor nota)
+        if text_msg and not image_b64:
+            sj_reply = _handle_sj_request(text_msg, remote_jid, conn=conn)
+            if sj_reply:
+                manager.emp_comm.send_whatsapp_text(remote_jid, sj_reply)
+                return jsonify({"status": "sj_sent_to_pic", "known_pic": known_pic})
+
+        # B2. Jika PIC hanya mengirim Kode Toko saja (misal: "TVKZ" atau "cek TVKZ") tanpa klaim masalah
+        clean_words = re.findall(r"[A-Za-z0-9]+", text_msg.strip())
+        kdtk_m = _find_kdtk(text_msg)
+        is_pure_store_query = (
+            not image_b64
+            and kdtk_m is not None
+            and len(clean_words) <= 3
+            and not any(w.lower() in {"kurang", "selisih", "hilangkan", "intransit", "nol", "0", "rusak", "basi", "mati", "tidak", "ga", "gak"} for w in clean_words)
+        )
+        if is_pure_store_query:
+            matched_rows = manager.emp_investigator.resolve_store_or_nota(
+                kdtk_or_query=kdtk_m.group(1),
+                only_open=True,
+                conn=conn,
+            )
+            lookup_reply = format_store_lookup_reply(kdtk_m.group(1), matched_rows, is_owner=False)
+            manager.emp_comm.send_whatsapp_text(remote_jid, lookup_reply)
+            return jsonify({"status": "store_lookup_replied", "kdtk": kdtk_m.group(1), "matches": len(matched_rows)})
+
+        # B3. Ekstrak laporan klaim PIC (teks bebas / foto layar NPB)
+        extracted = parse_pic_whatsapp_with_llm(push_name, text_msg, image_b64)
+        if not extracted.get("is_claim_report"):
+            return jsonify({"status": "not_a_claim_report"}), 200
+
+        kdtk_val = (extracted.get("kdtk") or "").strip().upper()
+        nama_toko_hint = (extracted.get("nama_toko_disebut") or "").strip() or _extract_store_name_query(text_msg)
+        nonota_val = str(extracted.get("nonota") or "").strip()
+        tgl_val = extracted.get("tgl_kirim") or date.today().strftime("%Y-%m-%d")
+
+        # AUTO-ENRICH DARI DB: Kalau PIC cuma sebut Kode Toko / Nama Toko tanpa nomor nota (atau cuma 4 digit SJ),
+        # otomatis cari nomor nota 10 digit & tanggal kirim aslinya di tabel v_rekap_selisih_intransit!
+        db_matched = []
+        if (kdtk_val and kdtk_val != "UNKNOWN") or nama_toko_hint or nonota_val:
+            q_store = kdtk_val if (kdtk_val and kdtk_val != "UNKNOWN") else nama_toko_hint
+            db_matched = manager.emp_investigator.resolve_store_or_nota(
+                kdtk_or_query=q_store,
+                nonota_or_last4=nonota_val if len(nonota_val) < 10 else "",
+                only_open=True,
+                conn=conn,
+            )
+            if db_matched:
+                best = db_matched[0]
+                if not kdtk_val or kdtk_val == "UNKNOWN":
+                    kdtk_val = best["kdtk"]
+                if len(nonota_val) < 8:
+                    nonota_val = best["nonota"]
+                if best.get("tgl_kirim"):
+                    tgl_val = str(best["tgl_kirim"])[:10]
+                if not extracted.get("item_dilaporkan") or extracted.get("item_dilaporkan") == "Lihat lampiran/teks":
+                    extracted["item_dilaporkan"] = (best.get("items_str") or "")[:150]
+
         wl_id = manager.emp_comm.register_pic_wa_to_waiting_list(
             office_conn=conn,
             pic_sender=push_name,
-            kdtk=extracted.get("kdtk", "UNKNOWN"),
-            nonota=extracted.get("nonota", ""),
-            tgl_kirim=extracted.get("tgl_kirim", date.today().strftime("%Y-%m-%d")),
+            kdtk=kdtk_val or "UNKNOWN",
+            nonota=nonota_val,
+            tgl_kirim=tgl_val,
             item_dilaporkan=extracted.get("item_dilaporkan", ""),
             klaim_pic=extracted.get("klaim_pic", text_msg),
             bukti_foto_path=f"wa_media_{int(datetime.now().timestamp())}.jpg" if image_b64 else "",
@@ -507,15 +753,26 @@ def whatsapp_webhook():
     finally:
         conn.close()
 
+    nota_info = f"`{nonota_val}`" if nonota_val else "Menunggu sinkronisasi H-1"
+    extra_db_note = ""
+    if len(db_matched) > 1:
+        other_notas = ", ".join(f"`{m['nonota']}`" for m in db_matched[1:4])
+        extra_db_note = f"\nℹ️ _Catatan: Toko {kdtk_val} juga memiliki nota aktif lain di sistem: {other_notas}._"
+
     ack_msg = (
         f"Siap Pak/Bu *{push_name}* 🙏,\n"
-        f"Laporan untuk Toko *{extracted.get('kdtk')}* "
-        f"(Nota: `{extracted.get('nonota') or 'Terlampir'}` | Item: _{extracted.get('item_dilaporkan')}_) "
-        f"sudah kami terima dan tercatat di sistem kami.\n\n"
-        f"Akan segera kami kroscek dan proses setelah sinkronisasi data H-1. Terima kasih infonya!"
+        f"Laporan untuk Toko *{kdtk_val or 'Terlampir'}* "
+        f"(Nota: {nota_info} | Tgl Kirim: `{tgl_val}` | Item: _{extracted.get('item_dilaporkan') or '-'}_) "
+        f"sudah otomatis dicocokkan dengan database dan tercatat di sistem kami (ID: #{wl_id}).{extra_db_note}\n\n"
+        f"Akan segera kami proses penyelesaiannya. Terima kasih infonya!"
     )
     manager.emp_comm.send_whatsapp_text(remote_jid, ack_msg)
-    return jsonify({"status": "registered_to_waiting_list", "waiting_list_id": wl_id, "extracted": extracted})
+    return jsonify({
+        "status": "registered_to_waiting_list",
+        "waiting_list_id": wl_id,
+        "auto_resolved_nonota": nonota_val,
+        "extracted": extracted,
+    })
 
 
 if __name__ == "__main__":

@@ -48,12 +48,12 @@ class TestNewPhases(unittest.TestCase):
         mock_ask_json.return_value = {
             "kategori": "salah_driver",
             "tindakan": "Beban Karyawan",
-            "confidence": 99,  # test fence: confidence should be clamped <= 85
+            "confidence": 99,
             "alasan": "Indikasi kelalaian driver",
         }
         action, conf, reason = self.leader.judge_single_case(case)
         self.assertEqual(action, "Beban Karyawan")
-        self.assertLessEqual(conf, 85)  # fence: Beban Karyawan never auto-approved
+        self.assertLessEqual(conf, 85)
         self.assertIn("INDIKASI KELALAIAN", reason)
 
     @patch("agents.leader.ask_json")
@@ -105,7 +105,6 @@ class TestNewPhases(unittest.TestCase):
         mock_cur = MagicMock()
         mock_conn.cursor.return_value.__enter__.return_value = mock_cur
 
-        # Mock query return values
         mock_cur.fetchone.return_value = {
             "total_reviews": 10,
             "approved_manual": 4,
@@ -132,7 +131,6 @@ class TestNewPhases(unittest.TestCase):
         mock_conn.cursor.return_value.__enter__.return_value = mock_cur
         mock_mgr.emp_investigator.get_office_conn.return_value = mock_conn
 
-        # Mock previous review
         mock_cur.fetchone.return_value = {
             "leader_recommendation": "Potong Batch",
             "confidence_score": 95,
@@ -144,7 +142,7 @@ class TestNewPhases(unittest.TestCase):
         self.assertIn("Penjualan Tunai", resp)
 
     @patch("main_orchestrator.manager")
-    def test_handle_owner_command_preseden(self, mock_mgr):
+    def test_handle_owner_command_preseden_smart_keyword(self, mock_mgr):
         from main_orchestrator import handle_owner_command
 
         mock_conn = MagicMock()
@@ -154,10 +152,83 @@ class TestNewPhases(unittest.TestCase):
         mock_mgr.emp_investigator.get_office_conn.return_value = mock_conn
         mock_cur.fetchone.return_value = None
 
-        resp = handle_owner_command("PRESEDEN TVKZ 2610171500 SJ Ulang Toko tutup renovasi 3 hari")
+        # Test stopwords removal ("Karena sedang" dibuang otomatis -> "toko tutup renovasi")
+        resp = handle_owner_command("PRESEDEN TVKZ 2610171500 SJ Ulang Karena sedang toko tutup renovasi 3 hari")
         self.assertIn("PRESEDEN #12 TERCATAT", resp)
         self.assertIn("SJ Ulang", resp)
         self.assertIn("toko tutup renovasi", resp)
+
+    @patch("main_orchestrator.manager")
+    def test_conversational_store_only_lookup(self, mock_mgr):
+        from main_orchestrator import handle_owner_command
+
+        mock_conn = MagicMock()
+        mock_mgr.emp_investigator.get_office_conn.return_value = mock_conn
+        mock_mgr.emp_investigator.resolve_store_or_nota.return_value = [{
+            "tipe": "INTRANSIT",
+            "kdcab": "G026",
+            "kdtk": "TVKZ",
+            "nama_toko": "Puri Junction",
+            "nonota": "2610171500",
+            "tgl_kirim": "2026-10-17",
+            "aging_days": 2,
+            "total_qty_selisih": 10,
+            "total_nilai_selisih": 148000.0,
+            "items_str": "Dimsum Ayam CBN",
+            "tindakan": "Belum Diproses",
+            "status": "Open",
+            "leader_recommendation": "SJ Ulang",
+        }]
+
+        # Cuma ketik "TVKZ" doang tanpa format komando
+        resp = handle_owner_command("TVKZ")
+        self.assertIn("DATA AKTIF TOKO TVKZ", resp)
+        self.assertIn("2610171500", resp)
+        self.assertIn("Dimsum Ayam CBN", resp)
+
+    @patch("main_orchestrator.manager")
+    def test_conversational_sj_request_by_store_code(self, mock_mgr):
+        from main_orchestrator import handle_owner_command
+
+        mock_conn = MagicMock()
+        mock_mgr.emp_investigator.get_office_conn.return_value = mock_conn
+        mock_mgr.emp_investigator.resolve_store_or_nota.return_value = [{
+            "kdtk": "TASC",
+            "nama_toko": "IDM Mas Mansyur 2",
+            "nonota": "2601022007",
+        }]
+        mock_mgr.emp_pipeline.download_sj_pdf_by_nota.return_value = {
+            "nonota": "2601022007",
+            "file_path": "/tmp/SJ_2601022007.pdf"
+        }
+        mock_mgr.emp_comm.send_whatsapp_document.return_value = {"status": "sent"}
+
+        # Minta SJ cuma pakai kode toko tanpa nomor nota 10 digit
+        resp = handle_owner_command("bro minta sj toko TASC dong")
+        self.assertIn("2601022007", resp)
+        self.assertIn("terkirim", resp)
+
+    @patch("main_orchestrator.manager")
+    def test_conversational_natural_action_without_nonota(self, mock_mgr):
+        from main_orchestrator import handle_owner_command
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_mgr.emp_investigator.get_office_conn.return_value = mock_conn
+        mock_mgr.emp_investigator.resolve_store_or_nota.return_value = [{
+            "kdtk": "TASC",
+            "nama_toko": "IDM Mas Mansyur 2",
+            "nonota": "2601022007",
+            "tgl_kirim": "2026-01-02",
+            "total_nilai_selisih": 21600.0,
+        }]
+        mock_cur.fetchone.return_value = None
+
+        # Eksekusi tindakan pakai bahasa santai tanpa kata SET dan tanpa nonota
+        resp = handle_owner_command("eh yang toko TASC potong batch aja bro")
+        self.assertIn("2601022007", resp)
+        self.assertIn("Potong Batch", resp)
 
 
 if __name__ == "__main__":
