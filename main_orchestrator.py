@@ -670,7 +670,9 @@ def whatsapp_webhook():
     # ── KASUS A: PESAN DARI OWNER (BOS RENDRA) ───────────────────────────────
     if is_owner:
         if text_msg.strip().upper() == "RUN MORNING":
-            res = manager.run_morning_workflow(auto_execute_high_confidence=False)
+            # skip_wa_send=True karena kita kirim sendiri dari sini (1x), bukan dari dalam workflow
+            res = manager.run_morning_workflow(auto_execute_high_confidence=False, skip_wa_send=True)
+            manager.emp_comm.send_whatsapp_text(remote_jid, res["briefing_message"])
             return jsonify({"status": "morning_triggered", "summary": res["leader_summary"]})
 
         reply = handle_owner_command(text_msg, remote_jid)
@@ -753,18 +755,20 @@ def whatsapp_webhook():
     finally:
         conn.close()
 
-    nota_info = f"`{nonota_val}`" if nonota_val else "Menunggu sinkronisasi H-1"
-    extra_db_note = ""
-    if len(db_matched) > 1:
-        other_notas = ", ".join(f"`{m['nonota']}`" for m in db_matched[1:4])
-        extra_db_note = f"\nℹ️ _Catatan: Toko {kdtk_val} juga memiliki nota aktif lain di sistem: {other_notas}._"
+    try:
+        tgl_human = datetime.strptime(str(tgl_val)[:10], "%Y-%m-%d").strftime("%d %b %Y")
+    except Exception:
+        tgl_human = str(tgl_val)
+
+    nota_part = f" (Nota `{nonota_val}`)" if nonota_val else ""
+    item_part = extracted.get("item_dilaporkan") or "item terkait"
+    toko_label = kdtk_val if (kdtk_val and kdtk_val != "UNKNOWN") else (nama_toko_hint or "terkait")
 
     ack_msg = (
-        f"Siap Pak/Bu *{push_name}* 🙏,\n"
-        f"Laporan untuk Toko *{kdtk_val or 'Terlampir'}* "
-        f"(Nota: {nota_info} | Tgl Kirim: `{tgl_val}` | Item: _{extracted.get('item_dilaporkan') or '-'}_) "
-        f"sudah otomatis dicocokkan dengan database dan tercatat di sistem kami (ID: #{wl_id}).{extra_db_note}\n\n"
-        f"Akan segera kami proses penyelesaiannya. Terima kasih infonya!"
+        f"Siap Kak/Pak/Bu *{push_name}*, terima kasih infonya 🙏\n\n"
+        f"Untuk laporan toko *{toko_label}* kiriman tanggal *{tgl_human}*{nota_part} "
+        f"terkait kendala _{item_part}_ sudah kami catat ya. "
+        f"Segera kami bantu kroscek dan tindak lanjuti."
     )
     manager.emp_comm.send_whatsapp_text(remote_jid, ack_msg)
     return jsonify({
@@ -793,4 +797,12 @@ if __name__ == "__main__":
         app = Flask(__name__)
         app.register_blueprint(agent_bp, url_prefix="/api/agent")
         print(f"🏢 Server Multi-Agent berjalan di port {args.port}...")
+        if manager.emp_comm.owner_wa:
+            manager.emp_comm.send_whatsapp_text(
+                manager.emp_comm.owner_wa,
+                f"🤖 *Argon Agent ONLINE* ✅\n"
+                f"📅 {datetime.now().strftime('%d %b %Y %H:%M WIB')}\n"
+                f"Port: {args.port}\n\n"
+                f"Siap terima komando, Bos. Ketik apa aja buat mulai."
+            )
         app.run(host="0.0.0.0", port=args.port, debug=False)

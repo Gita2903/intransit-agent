@@ -18,7 +18,7 @@ class ManagerAgent:
         self.emp_comm = CommunicatorEmployee()
         self.leader = LeaderAgent()
 
-    def run_morning_workflow(self, auto_execute_high_confidence: bool = False) -> Dict[str, Any]:
+    def run_morning_workflow(self, auto_execute_high_confidence: bool = False, skip_wa_send: bool = False) -> Dict[str, Any]:
         pipe_res = self.emp_pipeline.run_morning_ftp_and_excel_pipeline()
         kk_sync_res = self.emp_investigator.sync_kurang_kirim_from_homelab(full_sync=False)
 
@@ -37,7 +37,7 @@ class ManagerAgent:
             briefing_text = self._build_wa_briefing(
                 pipe_res, kk_sync_res, db_sync_res, leader_summary, executed_count
             )
-            if self.emp_comm.owner_wa:
+            if not skip_wa_send and self.emp_comm.owner_wa:
                 self.emp_comm.send_whatsapp_text(self.emp_comm.owner_wa, briefing_text)
 
             return {
