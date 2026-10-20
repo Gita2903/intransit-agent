@@ -1,0 +1,10 @@
+# ── intbk-agent-v2 gitignore ──────────────────────────────
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.zip
+storage/temp/
