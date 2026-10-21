@@ -1,6 +1,7 @@
 import os
 import unittest
 from unittest.mock import MagicMock, patch
+import main_orchestrator
 from agents.leader import LeaderAgent
 from agents.manager import ManagerAgent
 
@@ -229,6 +230,47 @@ class TestNewPhases(unittest.TestCase):
         resp = handle_owner_command("eh yang toko TASC potong batch aja bro")
         self.assertIn("2601022007", resp)
         self.assertIn("Potong Batch", resp)
+
+
+
+    @patch("main_orchestrator.parse_pic_whatsapp_with_llm")
+    @patch("main_orchestrator.manager")
+    def test_forwarded_relokasi_teej_to_t9dc_not_raya_and_not_pdf_spam(self, mock_mgr, mock_parse_llm):
+        from main_orchestrator import handle_owner_command, _find_all_kdtks
+
+        msg = (
+            "Pak rendra.. toko Teej citra 2\n\n"
+            "Menolak fz bento nya.. dan di alihkan ke toko raya serang 16_T9dc\n\n"
+            "Tolong di buatkan sj nya ya"
+        )
+        # 1. Pastikan _find_all_kdtks mengenali TEEJ dan T9DC (dari 16_T9dc), dan mengabaikan kata RAYA
+        codes = _find_all_kdtks(msg)
+        self.assertEqual(codes, ["TEEJ", "T9DC"])
+
+        # 2. Pastikan saat dikirim oleh Rendra (Owner), tidak nyasar download 5 PDF lama atau cek toko RAYA,
+        #    melainkan dicatat sebagai klaim relokasi TEEJ -> T9DC dan mencocokkan item Bento di DB!
+        mock_conn = MagicMock()
+        mock_mgr.emp_investigator.get_office_conn.return_value = mock_conn
+        mock_mgr.emp_investigator.resolve_store_or_nota.return_value = [
+            {"kdtk": "TEEJ", "nama_toko": "IDM CITRA RAYA 2", "nonota": "2610060477", "tgl_kirim": "2026-10-06", "items_str": "Bun Burger CBN, Vegetable CBN"},
+            {"kdtk": "TEEJ", "nama_toko": "IDM CITRA RAYA 2", "nonota": "2610090461", "tgl_kirim": "2026-10-09", "items_str": "Fz Bento Set Beef Yakiniku CBN"},
+        ]
+        mock_mgr.emp_comm.register_pic_wa_to_waiting_list.return_value = 99
+        mock_parse_llm.return_value = {
+            "is_claim_report": True,
+            "kdtk": "TEEJ",
+            "nonota": "",
+            "tgl_kirim": "2026-10-20",
+            "item_dilaporkan": "Fz Bento",
+            "klaim_pic": "Menolak Fz Bento, dialihkan ke toko T9DC, minta dibuatkan SJ",
+        }
+
+        resp = handle_owner_command(msg)
+        self.assertIn("TEEJ", resp)
+        self.assertIn("T9DC", resp)
+        # Harus memilih nota 2610090461 karena item_str-nya mengandung 'Bento'!
+        self.assertIn("2610090461", resp)
+        self.assertFalse(mock_mgr.emp_pipeline.download_sj_pdf_by_nota.called)
 
 
 if __name__ == "__main__":

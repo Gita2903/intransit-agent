@@ -29,7 +29,7 @@ class InvestigatorEmployee:
             "port": int(os.environ.get("OFFICE_DB_PORT", 3306)),
             "user": os.environ.get("OFFICE_DB_USER", "root"),
             "password": os.environ.get("OFFICE_DB_PASS", ""),
-            "database": os.environ.get("OFFICE_DB_NAME", "intbk_db"),
+            "database": os.environ.get("OFFICE_DB_NAME", "intbk_agent_db"),
             "cursorclass": pymysql.cursors.DictCursor,
         }
         self.homelab_db_cfg = {
@@ -176,9 +176,9 @@ class InvestigatorEmployee:
                                     "items_str": f"Terdaftar di Kurang Kirim (NoSJ: {kk.get('nomor_surat_jalan')})",
                                     "tindakan": "Belum Diproses",
                                     "status": "Open",
-                                    "leader_recommendation": "Potong Batch",
-                                    "confidence_score": 95,
-                                    "leader_reasoning": f"Terdaftar di kurang_kirim (lampiran: {kk.get('lampiran')})",
+                                    "leader_recommendation": None,
+                                    "confidence_score": None,
+                                    "leader_reasoning": f"Terdaftar di kurang_kirim gudang (lampiran: {kk.get('lampiran')}) - belum ada di rekap H-1",
                                 })
                 return rows
         finally:
@@ -498,10 +498,72 @@ class InvestigatorEmployee:
               KEY `idx_prec_keyword` (`kata_kunci`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
-        # Hanya buat view jika belum ada (agar tidak menimpa view produksi di admin_dashboard2)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS `rekap_intransit` (
+              `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT,
+              `tipe` enum('Intransit','Selisih BK') NOT NULL,
+              `kdcab` varchar(10) NOT NULL,
+              `kdtk` varchar(10) NOT NULL,
+              `nama_toko` varchar(150) DEFAULT NULL,
+              `nonota` varchar(30) NOT NULL,
+              `tgl_kirim` date NOT NULL,
+              `no_urut` int DEFAULT 0,
+              `kode_fg` varchar(50) NOT NULL,
+              `nama_produk` varchar(200) DEFAULT NULL,
+              `qty_sj` int DEFAULT 0,
+              `nilai_sj` decimal(15,2) DEFAULT 0.00,
+              `no_btb` varchar(50) DEFAULT NULL,
+              `qty_bpb` int DEFAULT 0,
+              `nilai_btb` decimal(15,2) DEFAULT 0.00,
+              `qty_selisih` int DEFAULT 0,
+              `nilai_selisih` decimal(15,2) DEFAULT 0.00,
+              `periode_start` date DEFAULT NULL,
+              `periode_end` date DEFAULT NULL,
+              `source_file` varchar(150) DEFAULT NULL,
+              `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (`id`),
+              UNIQUE KEY `uk_item_nota` (`kdtk`, `nonota`, `kode_fg`, `no_urut`),
+              KEY `idx_lookup` (`kdtk`, `nonota`, `tgl_kirim`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS `rekap_actions` (
+              `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT,
+              `kdtk` varchar(10) NOT NULL,
+              `nonota` varchar(30) NOT NULL,
+              `tindakan` varchar(50) NOT NULL DEFAULT 'Belum Diproses',
+              `status` enum('Open','Resolved','Closed') NOT NULL DEFAULT 'Open',
+              `keterangan` text DEFAULT NULL,
+              `updated_by` varchar(50) DEFAULT 'Hermes-CS',
+              `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              PRIMARY KEY (`id`),
+              UNIQUE KEY `uk_action` (`kdtk`, `nonota`),
+              KEY `idx_status` (`status`, `tindakan`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS `data_komplain` (
+              `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT,
+              `kdtk` varchar(10) NOT NULL,
+              `kdcab` varchar(10) DEFAULT NULL,
+              `nonota` varchar(30) DEFAULT NULL,
+              `tgl_kirim` date DEFAULT NULL,
+              `item_komplain` text DEFAULT NULL,
+              `keluhan` text NOT NULL,
+              `pelapor` varchar(100) DEFAULT NULL,
+              `status_komplain` enum('BARU','PROSES','SELESAI','DITOLAK') NOT NULL DEFAULT 'BARU',
+              `tindakan_diambil` varchar(50) DEFAULT NULL,
+              `catatan_cs` text DEFAULT NULL,
+              `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              PRIMARY KEY (`id`),
+              KEY `idx_komplain_lookup` (`kdtk`, `nonota`, `status_komplain`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
         try:
-            cur.execute("SHOW TABLES LIKE 'v_rekap_selisih_intransit'")
-            if not cur.fetchone():
-                cur.execute("CREATE VIEW v_rekap_selisih_intransit AS SELECT * FROM rekap_selisih_bk")
+            cur.execute("CREATE OR REPLACE VIEW `v_rekap_selisih_intransit` AS SELECT * FROM `rekap_intransit`")
+            cur.execute("CREATE OR REPLACE VIEW `rekap_selisih_bk` AS SELECT * FROM `rekap_intransit`")
+            cur.execute("CREATE OR REPLACE VIEW `rekap_selisih_bk_actions` AS SELECT * FROM `rekap_actions`")
         except Exception:
             pass

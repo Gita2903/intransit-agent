@@ -150,7 +150,7 @@ class PipelineEmployee:
             "details": report,
         }
 
-    def pull_detail_rekap_and_sync_to_db(self, office_conn) -> Dict[str, Any]:
+    def pull_detail_rekap_and_sync_to_db(self, office_conn, days_back: int = 2) -> Dict[str, Any]:
         h1 = date.today() - timedelta(days=1)
         end_str = f"{h1.day}-{h1.strftime('%B-%Y')}"
 
@@ -158,7 +158,7 @@ class PipelineEmployee:
         start_date = None
         try:
             with office_conn.cursor() as cur:
-                cur.execute("SELECT MAX(tgl_kirim) AS max_tgl FROM rekap_selisih_bk")
+                cur.execute("SELECT MAX(tgl_kirim) AS max_tgl FROM rekap_intransit")
                 row = cur.fetchone()
                 if row and row.get("max_tgl"):
                     start_date = row["max_tgl"]
@@ -166,12 +166,12 @@ class PipelineEmployee:
             start_date = None
 
         if not start_date or start_date > h1:
-            start_date = max(date(2026, 1, 1), h1 - timedelta(days=3))
+            start_date = max(date(2026, 1, 1), h1 - timedelta(days=days_back))
         if (h1 - start_date).days > 7:
             start_date = h1 - timedelta(days=7)
 
         insert_sql = """
-            INSERT INTO rekap_selisih_bk
+            INSERT INTO rekap_intransit
                 (tipe, periode_start, periode_end, no_urut, kode_fg, nama_produk, kdcab, kdtk,
                  nama_toko, nonota, tgl_kirim, qty_sj, nilai_sj, no_btb,
                  qty_bpb, nilai_btb, qty_selisih, nilai_selisih, source_file)
